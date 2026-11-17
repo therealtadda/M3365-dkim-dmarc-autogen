@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/therealtadda/M3365-dkim-dmarc-autogen/external-runner-result.schema.json",
+  "title": "External DKIM and DMARC runner result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "Operation",
+    "State",
+    "Domain",
+    "Tenant",
+    "DkimInitiallyEnabled",
+    "Health",
+    "Actions",
+    "Changes",
+    "Conflicts",
+    "Warnings",
+    "Error",
+    "RunDirectory",
+    "ResultFile"
+  ],
+  "properties": {
+    "Operation": {
+      "type": "string",
+      "enum": ["Preview", "Apply"]
+    },
+    "State": {
+      "type": "string",
+      "enum": ["Preview", "Completed", "Conflict", "Pending", "Failed", "Partial"]
+    },
+    "Domain": {
+      "type": "string"
+    },
+    "Tenant": {
+      "type": ["string", "null"]
+    },
+    "DkimInitiallyEnabled": {
+      "type": ["boolean", "null"]
+    },
+    "Health": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/observation"
+      }
+    },
+    "Actions": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "Changes": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "Conflicts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "Warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "Error": {
+      "type": ["string", "null"]
+    },
+    "RunDirectory": {
+      "type": ["string", "null"]
+    },
+    "ResultFile": {
+      "type": ["string", "null"]
+    }
+  },
+  "$defs": {
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "Name",
+        "Status",
+        "Source",
+        "Expected",
+        "Observed",
+        "Detail",
+        "CheckedAtUtc"
+      ],
+      "properties": {
+        "Name": {
+          "type": "string"
+        },
+        "Status": {
+          "type": "string",
+          "enum": ["Pass", "Fail", "Pending", "NotVerifiable"]
+        },
+        "Source": {
+          "type": "string"
+        },
+        "Expected": {},
+        "Observed": {},
+        "Detail": {
+          "type": "string"
+        },
+        "CheckedAtUtc": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}

@@ -31,7 +31,7 @@ Describe 'Public command help' {
             if ($ast -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $ast = $ast.Body }
             $explicitParameters = @($ast.ParamBlock.Parameters |
                 ForEach-Object { $_.Name.VariablePath.UserPath })
-            $explicitParameters.Count | Should -Be 9
+            $explicitParameters.Count | Should -Be 11
             foreach ($parameter in $explicitParameters) {
                 $parameterHelp = Get-Help $surface.Name -Parameter $parameter
                 ($parameterHelp.Description.Text -join ' ').Length | Should -BeGreaterThan 35 -Because "$($surface.Name) must explain $parameter"
@@ -42,6 +42,7 @@ Describe 'Public command help' {
             foreach ($pattern in 'AsSecureString', '-Apply', '-WhatIf', '-ReplaceConflictingRecords', '-DnsZone', '\.Health') {
                 $exampleText | Should -Match $pattern
             }
+            (Get-Help $surface.Name -Parameter ExchangeConnectionId | Out-String) | Should -Match 'runner|connection'
         }
 
         Should -Invoke Read-Host -Times 0
@@ -66,6 +67,7 @@ Describe 'Public command help' {
                 $text | Should -Match $pattern -Because "$($surface.Name) must describe $pattern"
             }
         }
+
     }
 
     It 'distinguishes entry-script exit codes from module object results' {
@@ -76,5 +78,23 @@ Describe 'Public command help' {
         $scriptHelp | Should -Match 'do not dot-source'
         $moduleHelp = Get-Help Invoke-M365DomainAuthentication -Full | Out-String -Width 240
         $moduleHelp | Should -Match 'does not set script process exit codes'
+    }
+}
+
+Describe 'External runner help' {
+    It 'documents the standalone non-interactive boundary without executing it' {
+        $runner = Join-Path $PSScriptRoot '..\Invoke-M365DomainAuthenticationRunner.ps1'
+        $help = Get-Help $runner -Full
+        ($help.Description.Text -join ' ') | Should -Match 'outside CIPP'
+        ($help.Description.Text -join ' ') | Should -Match 'OpenAPI'
+        @($help.Examples.Example).Count | Should -BeGreaterOrEqual 2
+        foreach ($parameter in @(
+            'Domain', 'Operation', 'ExchangeOrganization', 'ExchangeApplicationId',
+            'ExchangeCertificateThumbprint', 'GoDaddyTokenEnvironmentVariable',
+            'ResultFile'
+        )) {
+            (Get-Help $runner -Parameter $parameter).Description.Text |
+                Out-String | Should -Not -BeNullOrEmpty
+        }
     }
 }

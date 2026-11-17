@@ -12,6 +12,7 @@ DMARC is a DNS policy, not a feature switch in Microsoft 365. New policies use m
 - [Requirements](#requirements)
 - [GoDaddy setup](#godaddy-setup)
 - [Preview and apply](#preview-and-apply)
+- [CIPP integration](#cipp-integration)
 - [Parameter reference](#parameter-reference)
 - [Built-in PowerShell help](#built-in-powershell-help)
 - [Ordered health gates](#ordered-health-gates)
@@ -123,6 +124,114 @@ If `mail.example.com` uses the parent GoDaddy zone:
 
 This maps `_dmarc` to `_dmarc.mail`, and the selectors to `selector1._domainkey.mail` and `selector2._domainkey.mail` in the parent zone. If the subdomain has its own delegated GoDaddy zone, pass that zone instead. Child delegations under managed record names require manual resolution; the tool never changes delegation.
 
+## CIPP integration
+
+Use `Invoke-M365DomainAuthenticationRunner.ps1` as the repository-owned external
+process entry point. It is deliberately outside CIPP: it imports no CIPP
+repository code, accepts no CIPP session token, and does not assume CIPP can run
+an arbitrary script. The runner connects directly to Exchange Online and GoDaddy
+with its own managed credentials, performs the existing health-gated workflow,
+and returns one structured JSON result.
+
+The runner requires Windows PowerShell 7.2+ because public DNS validation uses
+`Resolve-DnsName`. Its host must have `ExchangeOnlineManagement` 3.0+, outbound
+Microsoft/GoDaddy HTTPS, and DNS access to the documented resolvers and
+authoritative nameservers. A Linux-only orchestration host is a blocker unless a
+cross-platform DNS implementation is added separately.
+
+```powershell
+# A secret provider sets the PAT immediately before this process starts.
+$env:M365_DOMAIN_AUTH_GODADDY_PAT = $securelyLoadedPatPlaintext
+
+pwsh -NoProfile -File .\Invoke-M365DomainAuthenticationRunner.ps1 `
+    -Domain example.com `
+    -Operation Preview `
+    -ExchangeOrganization tenant.onmicrosoft.com `
+    -ExchangeApplicationId $env:M365_EXO_APP_ID `
+    -ExchangeCertificateThumbprint $env:M365_EXO_CERT_THUMBPRINT `
+    -ResultFile C:\protected\results\example-preview.json
+
+# CIPP or another orchestrator must not issue Apply without reviewed approval.
+```
+
+The runner uses Exchange Online app-only certificate authentication. The app
+registration needs the Exchange RBAC permissions required by this repository,
+and the process identity needs access to the certificate private key. The
+certificate thumbprint and application ID are identifiers, not replacement
+secrets; the GoDaddy PAT is injected only through a process environment variable
+and is never a request field or command-line argument. The secret provider must
+clear the environment value after the process exits.
+
+The runner requires a clean PowerShell runspace. It records the pre-run
+connections, creates one Exchange connection, uses that connection for all
+Exchange reads and writes, and disconnects only the uniquely identified
+connection it created. A pre-existing connection, ambiguous connection, or
+connection cleanup failure blocks successful completion or produces `Partial`.
+
+The exact external-runner input contract is
+[`external-runner-request.schema.json`](external-runner-request.schema.json):
+
+- Required: `domain`, `operation` (`Preview` or `Apply`),
+  `exchangeOrganization`, `exchangeApplicationId`,
+  `exchangeCertificateThumbprint`.
+- Optional: `dnsZone`, `goDaddyTokenEnvironmentVariable`,
+  `timeoutMinutes`, `pollSeconds`, `reportDirectory`, `resultFile`.
+
+The exact JSON result contract is
+[`external-runner-result.schema.json`](external-runner-result.schema.json):
+`Operation`, `State`, `Domain`, `Tenant`, `DkimInitiallyEnabled`, `Health`,
+`Actions`, `Changes`, `Conflicts`, `Warnings`, `Error`, `RunDirectory`, and
+`ResultFile`. Only `Operation=Preview, State=Preview` and
+`Operation=Apply, State=Completed` are successful. `Conflict`, `Pending`,
+`Failed`, and `Partial` require inspection and a controlled rerun.
+
+`ResultFile` persists credential-free results for every operation, including
+connection/authentication failures, by replacing a sibling temporary file. Apply
+runs also create `dns-before.json` and `result.json` in a unique protected
+`RunDirectory`. The runner returns process exit code `0` for Preview/Completed,
+`2` for Conflict/Pending, and `1` for Failed/Partial.
+
+The idempotency boundary is live state: each run re-reads Exchange, the GoDaddy
+zone, and public DNS, and changes only missing or mismatching managed resources.
+Serialize Apply calls for a tenant/domain; do not concurrently edit the same DNS
+records. DNS conflicts and policy replacements remain outside non-interactive
+automation and require a separately reviewed interactive run.
+
+### CIPP API binding
+
+CIPP custom tests cannot execute this runner. According to CIPP's documented
+custom-test guidance, they are read-only, cannot change a client tenant, run in
+PowerShell ConstrainedLanguage, and read through `Get-CIPPTestData`. They can be
+used to display a compliance/readiness check, but not to create mailboxes, write
+DNS, or enable DKIM.
+
+CIPP's public endpoint list is deployment-generated rather than a fixed
+allow-list. The authoritative contract is the `openapi.json` and **CIPP →
+Integrations → CIPP-API → API Documentation** page for the exact CIPP instance.
+Do not invent a script-execution endpoint. CIPP OAuth app-only API clients and
+the `/api` base are documented, but a binding for this workflow must be added
+only if the live OpenAPI exposes an operation that explicitly supports the
+required mutation or external job handoff.
+
+Until such an operation is verified, use CIPP only through documented read
+operations that the instance actually exposes, and let the external orchestration
+platform invoke this runner and retain its JSON result. CIPP must never receive
+the GoDaddy PAT or Exchange certificate private key as an API payload. The
+runner's `Tenant` and `Domain` results can correlate its artifacts with CIPP
+tenant/domain data without coupling the tools.
+
+See the CIPP documentation for
+[read-only custom tests](https://docs.cipp.app/user-documentation/tools/custom-tests/add),
+[instance-generated endpoints](https://docs.cipp.app/api-documentation/endpoints),
+and [API setup and OAuth authentication](https://docs.cipp.app/api-documentation/setup-and-authentication).
+
+### CA policy repository boundary
+
+This repository does not clone, read, or depend on a policy repository. A CIPP
+or external policy-repository adapter must separately pin/validate its own
+revision and deploy CA policy definitions using a supported documented operation.
+No policy-repository path, token, or policy data is part of this runner request.
+
 ## Parameter reference
 
 The entry script and exported `Invoke-M365DomainAuthentication` function accept the same task parameters:
@@ -130,8 +239,10 @@ The entry script and exported `Invoke-M365DomainAuthentication` function accept 
 | Parameter | Required / default | Behavior |
 |---|---|---|
 | `-Domain <string>` | Required | One existing M365 mail domain, such as `example.com`. Case and a trailing dot are normalized. Use ASCII/punycode for internationalized names; no URL, path, wildcard, or comma-separated list. |
-| `-AdminUserPrincipalName <string>` | Required | Administrator sign-in UPN for interactive Exchange Online authentication. |
+| `-AdminUserPrincipalName <string>` | Interactive required | Administrator sign-in UPN for interactive Exchange Online authentication. |
 | `-GoDaddyToken <SecureString>` | Secure prompt if omitted | Production GoDaddy PAT. Obtain with `Read-Host -AsSecureString` or a secret manager, not a plaintext command argument. |
+| `-ExchangeConnectionId <string>` | Caller-managed non-interactive | Identifier of a sole existing Exchange connection in the current PowerShell runspace. Never disconnected by the module; a runner owns its lifecycle. |
+| `-NonInteractive` | Off | Requires `ExchangeConnectionId` and a supplied token; rejects prompts and DNS-replacement requests. |
 | `-DnsZone <string>` | Defaults to `Domain` | GoDaddy zone containing the managed records. Must equal the mail domain or be its parent at a DNS-label boundary. |
 | `-Apply` | Off | Authorizes tenant/DNS mutation. Without it, the tool only previews. |
 | `-ReplaceConflictingRecords` | Off | Proposes eligible managed-record replacements; actual replacement still requires `-Apply` and interactive confirmation. Does not override recipient collisions, unsafe delegation, or malformed/multiple DMARC policies. |
@@ -294,7 +405,11 @@ Finally send a real message to an independent recipient and inspect `Authenticat
 
 ## Scope and limitations
 
-This is an interactively run, single-domain tool. It does not onboard or verify new M365 domains, process a bulk domain list, buy domains, change nameservers, manage other DNS providers, configure unattended authentication, or install a recurring job.
+This is a single-domain tool with interactive and external-runner entry points.
+It does not onboard or verify new M365 domains, process a bulk domain list, buy
+domains, change nameservers, manage other DNS providers, supply an orchestration
+platform's authentication implementation, read a policy repository, or install
+a recurring job.
 
 It does not change SPF, MX/mail routing, mailbox permissions, forwarding, licenses, retention, DKIM key rotation, or automatically move DMARC to quarantine/reject. Mailbox existence checks confirm Exchange provisioning and address ownership, **not inbound delivery**; verify existing MX/routing and actual report reception separately. Reporting mailbox names cannot be customized in this version.
 

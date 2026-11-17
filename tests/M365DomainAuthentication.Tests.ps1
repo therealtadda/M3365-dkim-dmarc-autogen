@@ -11,7 +11,7 @@ BeforeAll {
         function script:New-Mailbox { param([switch]$Shared, $Name, $Alias, $DisplayName, $PrimarySmtpAddress, $ErrorAction) }
         function script:Get-EXORecipient { param($Filter, [switch]$IncludeSoftDeletedRecipients, $Properties, $ResultSize, $ErrorAction) }
         function script:Get-EXOMailbox { param($Filter, $Properties, $ResultSize, $ErrorAction) }
-        function script:Connect-ExchangeOnline { param($UserPrincipalName, $ShowBanner, $ErrorAction) }
+        function script:Connect-ExchangeOnline { param($UserPrincipalName, $AppId, $CertificateThumbprint, $Organization, $ShowBanner, $ErrorAction) }
         function script:Get-ConnectionInformation { param($ErrorAction) }
         function script:Disconnect-ExchangeOnline { param($ConnectionId, $Confirm, [switch]$WhatIf, $ErrorAction) }
 
@@ -519,6 +519,120 @@ Describe 'End-to-end workflow with mocked external services' {
             Test-Path $script:invokeParameters.ReportDirectory | Should -BeFalse
             Should -Invoke Disconnect-ExchangeOnline -Times 1 -ParameterFilter { $ConnectionId -eq 'owned' }
             Should -Invoke Disconnect-ExchangeOnline -Times 0 -ParameterFilter { $ConnectionId -eq 'existing' }
+        }
+        It 'supports a caller-owned Exchange connection without prompts or disconnects' {
+            $parameters = $script:invokeParameters.Clone()
+            $parameters.Remove('AdminUserPrincipalName')
+            $result = Invoke-M365DomainAuthentication @parameters `
+                -ExchangeConnectionId existing -NonInteractive
+            $result.State | Should -Be 'Preview'
+            $result.Operation | Should -Be 'Preview'
+            $result.Tenant | Should -Be 'other-tenant'
+            Should -Invoke Connect-ExchangeOnline -Times 0
+            Should -Invoke Disconnect-ExchangeOnline -Times 0
+        }
+        It 'rejects interactive replacement and missing credentials in runner mode' {
+            $parameters = $script:invokeParameters.Clone()
+            $parameters.Remove('AdminUserPrincipalName')
+            $parameters.Remove('GoDaddyToken')
+            $result = Invoke-M365DomainAuthentication @parameters `
+                -ExchangeConnectionId existing -NonInteractive
+            $result.State | Should -Be 'Failed'
+            $result.Error | Should -Match 'requires GoDaddyToken'
+
+            $result = Invoke-M365DomainAuthentication @parameters `
+                -GoDaddyToken $script:invokeParameters.GoDaddyToken `
+                -ExchangeConnectionId existing -NonInteractive -ReplaceConflictingRecords
+            $result.State | Should -Be 'Failed'
+            $result.Error | Should -Match 'cannot be requested'
+            Should -Invoke Invoke-RestMethod -Times 0
+        }
+        It 'rejects ambiguous caller-owned Exchange connections' {
+            Mock Get-ConnectionInformation {
+                [pscustomobject]@{ ConnectionId = 'existing'; TenantID = 'other-tenant' }
+                [pscustomobject]@{ ConnectionId = 'extra'; TenantID = 'wrong-tenant' }
+            }
+            $parameters = $script:invokeParameters.Clone()
+            $parameters.Remove('AdminUserPrincipalName')
+            $result = Invoke-M365DomainAuthentication @parameters `
+                -ExchangeConnectionId existing -NonInteractive
+            $result.State | Should -Be 'Failed'
+            $result.Error | Should -Match 'only active Exchange connection'
+            Should -Invoke Get-AcceptedDomain -Times 0
+            Should -Invoke Disconnect-ExchangeOnline -Times 0
+        }
+        It 'creates and disconnects only the external runner Exchange connection' {
+            $variable = 'EXTERNAL_TEST_GODADDY_PAT'
+            [Environment]::SetEnvironmentVariable($variable, 'test-token', 'Process')
+            $script:runnerConnectionReads = 0
+            Mock Get-ConnectionInformation {
+                $script:runnerConnectionReads++
+                if ($script:runnerConnectionReads -gt 1) {
+                    [pscustomobject]@{ ConnectionId = 'runner-owned'; TenantID = 'test-tenant' }
+                }
+            }
+            Mock Read-Host { throw 'Runner must not prompt' }
+            try {
+                $result = Invoke-M365DomainAuthenticationRunner -Domain example.com `
+                    -Operation Apply -ExchangeOrganization tenant.onmicrosoft.com `
+                    -ExchangeApplicationId 'app-id' -ExchangeCertificateThumbprint 'thumbprint' `
+                    -GoDaddyTokenEnvironmentVariable $variable
+                $result.State | Should -Be 'Completed'
+                $result.Operation | Should -Be 'Apply'
+                $result.Tenant | Should -Be 'test-tenant'
+                Should -Invoke New-Mailbox -Times 2
+                Should -Invoke Set-DkimSigningConfig -Times 1
+                Should -Invoke Connect-ExchangeOnline -Times 1 -ParameterFilter {
+                    $AppId -eq 'app-id' -and $CertificateThumbprint -eq 'thumbprint' -and
+                    $Organization -eq 'tenant.onmicrosoft.com'
+                }
+                Should -Invoke Disconnect-ExchangeOnline -Times 1 -ParameterFilter {
+                    $ConnectionId -eq 'runner-owned'
+                }
+                Should -Invoke Read-Host -Times 0
+            }
+            finally {
+                [Environment]::SetEnvironmentVariable($variable, $null, 'Process')
+            }
+        }
+        It 'persists structured runner failures without exposing the secret variable' {
+            $resultFile = Join-Path $TestDrive 'runner-error.json'
+            Mock Get-ConnectionInformation {}
+            $result = Invoke-M365DomainAuthenticationRunner -Domain example.com `
+                -Operation Preview -ExchangeOrganization tenant.onmicrosoft.com `
+                -ExchangeApplicationId 'app-id' -ExchangeCertificateThumbprint 'thumbprint' `
+                -GoDaddyTokenEnvironmentVariable EXTERNAL_MISSING_TEST_PAT `
+                -ResultFile $resultFile
+            $result.State | Should -Be 'Failed'
+            $result.Operation | Should -Be 'Preview'
+            $result.Error | Should -Match 'missing or empty'
+            $result.ResultFile | Should -Be $resultFile
+            $persisted = Get-Content -LiteralPath $resultFile -Raw
+            $persisted | Should -Not -Match 'test-token'
+            ($persisted | ConvertFrom-Json).State | Should -Be 'Failed'
+            $schema = Get-Content (Join-Path $PSScriptRoot '..\external-runner-result.schema.json') -Raw
+            Test-Json -Json $persisted -Schema $schema | Should -BeTrue
+            Should -Invoke Connect-ExchangeOnline -Times 0
+        }
+        It 'requires an explicit runner operation' {
+            (Get-Command Invoke-M365DomainAuthenticationRunner).Parameters.Operation.Attributes |
+                Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] } |
+                ForEach-Object { $_.Mandatory } | Should -Contain $true
+        }
+        It 'validates the external runner request schema without accepting plaintext secrets' {
+            $schema = Get-Content (Join-Path $PSScriptRoot '..\external-runner-request.schema.json') -Raw
+            $valid = @{
+                domain = 'example.com'; operation = 'Preview'
+                exchangeOrganization = 'tenant.onmicrosoft.com'
+                exchangeApplicationId = 'app-id'
+                exchangeCertificateThumbprint = 'thumbprint'
+            } | ConvertTo-Json -Compress
+            Test-Json -Json $valid -Schema $schema | Should -BeTrue
+            $secretBearing = $valid |
+                ConvertFrom-Json -AsHashtable
+            $secretBearing.goDaddyToken = 'must-not-be-json'
+            { Test-Json -Json ($secretBearing | ConvertTo-Json -Compress) -Schema $schema -ErrorAction Stop } |
+                Should -Throw
         }
         It 'keeps Apply WhatIf read-only, including mailbox creation' {
             $result = Invoke-M365DomainAuthentication @script:invokeParameters -Apply -WhatIf

@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/therealtadda/M3365-dkim-dmarc-autogen/external-runner-request.schema.json",
+  "title": "External DKIM and DMARC runner request",
+  "description": "Inputs accepted by Invoke-M365DomainAuthenticationRunner or its process script.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "domain",
+    "operation",
+    "exchangeOrganization",
+    "exchangeApplicationId",
+    "exchangeCertificateThumbprint"
+  ],
+  "properties": {
+    "domain": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Existing Microsoft 365 accepted domain to inspect or configure."
+    },
+    "operation": {
+      "type": "string",
+      "enum": [
+        "Preview",
+        "Apply"
+      ],
+      "description": "Preview is read-only. Apply authorizes the engine's idempotent planned changes."
+    },
+    "exchangeOrganization": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S",
+      "description": "Tenant domain used for Exchange Online app-only authentication."
+    },
+    "exchangeApplicationId": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S",
+      "description": "Runner-owned Exchange application client ID."
+    },
+    "exchangeCertificateThumbprint": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S",
+      "description": "Thumbprint of a runner-accessible certificate used for Exchange authentication."
+    },
+    "dnsZone": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional GoDaddy parent zone when the domain is a subdomain."
+    },
+    "goDaddyTokenEnvironmentVariable": {
+      "type": "string",
+      "default": "M365_DOMAIN_AUTH_GODADDY_PAT",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+      "description": "Name of a secret-provider-injected process environment variable containing the GoDaddy PAT."
+    },
+    "timeoutMinutes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 120,
+      "default": 10
+    },
+    "pollSeconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 300,
+      "default": 30
+    },
+    "reportDirectory": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Protected artifact directory for apply snapshots and result reports."
+    },
+    "resultFile": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional file path whose existing parent directory is used to persist every returned result state, including adapter failures."
+    }
+  }
+}

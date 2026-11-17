@@ -545,8 +545,9 @@ function Invoke-M365DomainAuthentication {
     dot are normalized. The domain must equal DnsZone or be its subdomain.
 
     .PARAMETER AdminUserPrincipalName
-    Required administrator sign-in UPN for interactive Exchange Online login with
-    your tenant's MFA policy. This UPN may use a different domain from Domain.
+    Administrator sign-in UPN for interactive Exchange Online login with your
+    tenant's MFA policy. Required unless ExchangeConnectionId is supplied. This
+    UPN may use a different domain from Domain.
 
     .PARAMETER GoDaddyToken
     GoDaddy production Personal Access Token as a SecureString. If omitted, prompts
@@ -558,6 +559,17 @@ function Invoke-M365DomainAuthentication {
     GoDaddy-hosted zone containing the managed records; defaults to Domain.
     For mail.example.com hosted in example.com, specify example.com. Records
     become _dmarc.mail and selector1/selector2._domainkey.mail in that zone.
+
+    .PARAMETER ExchangeConnectionId
+    Identifier of an Exchange Online connection already established by the caller.
+    The connection must be for the intended tenant and remain in the same
+    PowerShell runspace. It is never disconnected by this function. Use this mode
+    for external runner-owned Exchange authentication.
+
+    .PARAMETER NonInteractive
+    Disallows credential prompts and interactive DNS-replacement confirmation.
+    Requires ExchangeConnectionId and a supplied GoDaddyToken. Intended for the
+    external runner.
 
     .PARAMETER Apply
     Authorizes real mailbox, DKIM configuration, and DNS changes. Off by default.
@@ -589,8 +601,9 @@ function Invoke-M365DomainAuthentication {
 
     .OUTPUTS
     System.Management.Automation.PSCustomObject
-    Contains State, Domain, Tenant, DkimInitiallyEnabled, Health, Actions, Changes,
-    Conflicts, Warnings, Error, and RunDirectory. States are Preview, Completed,
+    Contains Operation, State, Domain, Tenant, DkimInitiallyEnabled, Health,
+    Actions, Changes, Conflicts, Warnings, Error, RunDirectory, and ResultFile.
+    States are Preview, Completed,
     Conflict, Pending, Failed, and Partial. Preview is not proof of readiness;
     inspect Health and Conflicts. Only Completed confirms all mandatory gates.
     Health records Pass, Fail, Pending, or NotVerifiable with source, expected and
@@ -671,11 +684,13 @@ function Invoke-M365DomainAuthentication {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param(
         [Parameter(Mandatory)][string]$Domain,
-        [Parameter(Mandatory)][string]$AdminUserPrincipalName,
+        [string]$AdminUserPrincipalName,
         [Security.SecureString]$GoDaddyToken,
+        [string]$ExchangeConnectionId,
         [string]$DnsZone,
         [switch]$Apply,
         [switch]$ReplaceConflictingRecords,
+        [switch]$NonInteractive,
         [ValidateRange(1, 120)][int]$TimeoutMinutes = 10,
         [ValidateRange(1, 300)][int]$PollSeconds = 30,
         [string]$ReportDirectory = (Join-Path $PWD '.m365-auth-runs')
@@ -689,9 +704,11 @@ function Invoke-M365DomainAuthentication {
         Changes = [Collections.Generic.List[object]]::new(); Warnings = [Collections.Generic.List[string]]::new()
     }
     $result = [pscustomobject]@{
+        Operation = if ($Apply) { 'Apply' } else { 'Preview' }
         State = 'Failed'; Domain = $Domain; Tenant = $null; DkimInitiallyEnabled = $null
         Health = $context.Health; Actions = $context.Actions; Changes = $context.Changes
         Conflicts = $context.Conflicts; Warnings = $context.Warnings; Error = $null; RunDirectory = $null
+        ResultFile = $null
     }
     $connectionId = $null
     $mutating = $false
@@ -700,17 +717,37 @@ function Invoke-M365DomainAuthentication {
         $result.Domain = $context.Domain
         $context.Zone = if ($DnsZone) { ConvertTo-DomainName $DnsZone } else { $context.Domain }
         if ($context.Domain -ne $context.Zone -and -not $context.Domain.EndsWith(".$($context.Zone)")) { throw 'Domain must equal DnsZone or be its subdomain.' }
-        if ($AdminUserPrincipalName -notmatch '^[^@\s]+@[^@\s]+$') { throw 'AdminUserPrincipalName must be a sign-in UPN.' }
+        if ($ExchangeConnectionId -and $AdminUserPrincipalName) {
+            throw 'Supply AdminUserPrincipalName or ExchangeConnectionId, not both.'
+        }
+        if ($NonInteractive -and -not $ExchangeConnectionId) {
+            throw 'NonInteractive mode requires an existing ExchangeConnectionId.'
+        }
+        if ($ExchangeConnectionId -and -not $NonInteractive) {
+            throw 'ExchangeConnectionId requires NonInteractive mode.'
+        }
+        if (-not $ExchangeConnectionId -and $AdminUserPrincipalName -notmatch '^[^@\s]+@[^@\s]+$') {
+            throw 'AdminUserPrincipalName must be a sign-in UPN unless ExchangeConnectionId is supplied.'
+        }
+        if ($NonInteractive -and $ReplaceConflictingRecords) {
+            throw 'DNS replacements are interactive and cannot be requested in NonInteractive mode.'
+        }
         $context.ZonePath = "/zones/$([uri]::EscapeDataString($context.Zone))"
         $context.Addresses = @("dmarc-rua@$($context.Domain)", "dmarc-ruf@$($context.Domain)")
         if (("selector1._domainkey.$($context.Domain)").Length -gt 253 -or
             @($context.Addresses | Where-Object { $_.Length -gt 254 }).Count -gt 0) {
             throw 'Domain is too long for the derived managed DNS names or reporting SMTP addresses.'
         }
-        foreach ($command in 'Resolve-DnsName', 'Connect-ExchangeOnline', 'Get-EXORecipient', 'Get-EXOMailbox') {
+        foreach ($command in 'Resolve-DnsName', 'Get-EXORecipient', 'Get-EXOMailbox') {
             if (-not (Get-Command $command -ErrorAction SilentlyContinue)) { throw "Required command $command is missing. See README installation instructions." }
         }
-        if ($null -eq $GoDaddyToken) { $GoDaddyToken = Read-Host 'GoDaddy production PAT (not stored)' -AsSecureString }
+        if (-not $ExchangeConnectionId -and -not (Get-Command Connect-ExchangeOnline -ErrorAction SilentlyContinue)) {
+            throw 'Required command Connect-ExchangeOnline is missing. See README installation instructions.'
+        }
+        if ($null -eq $GoDaddyToken) {
+            if ($NonInteractive) { throw 'NonInteractive mode requires GoDaddyToken to be supplied.' }
+            $GoDaddyToken = Read-Host 'GoDaddy production PAT (not stored)' -AsSecureString
+        }
         $context.Token = [Net.NetworkCredential]::new('', $GoDaddyToken).Password
         if (-not $context.Token -or $context.Token -match '[\r\n]') { throw 'A nonempty GoDaddy PAT is required.' }
         $records = @(Get-ZoneRecords $context)
@@ -718,19 +755,32 @@ function Invoke-M365DomainAuthentication {
         Add-Health $context 'GoDaddyReadAccess' Pass 'GoDaddy v3' 'Readable DNS zone' $context.Zone
         $context.Authorities = @(Get-AuthoritativeServers $context $records)
         Import-Module ExchangeOnlineManagement -MinimumVersion 3.0 -ErrorAction Stop
-        if (-not (Get-Command Disconnect-ExchangeOnline -ErrorAction Stop).Parameters.ContainsKey('ConnectionId')) {
+        if (-not $ExchangeConnectionId -and -not (Get-Command Disconnect-ExchangeOnline -ErrorAction Stop).Parameters.ContainsKey('ConnectionId')) {
             throw 'Update ExchangeOnlineManagement: connection-scoped disconnect is required.'
         }
-        $beforeConnections = @(Get-ConnectionInformation -ErrorAction Stop | ForEach-Object { $_.ConnectionId })
-        try {
-            $null = Connect-ExchangeOnline -UserPrincipalName $AdminUserPrincipalName -ShowBanner:$false -ErrorAction Stop
+        if ($ExchangeConnectionId) {
+            $allConnections = @(Get-ConnectionInformation -ErrorAction Stop)
+            $connections = @($allConnections | Where-Object ConnectionId -EQ $ExchangeConnectionId)
+            if ($allConnections.Count -ne 1 -or $connections.Count -ne 1) {
+                throw "Exchange connection '$ExchangeConnectionId' must be the only active Exchange connection in this PowerShell runspace."
+            }
+            $connection = $connections[0]
+            if (-not $connection.TenantID) {
+                throw "Exchange connection '$ExchangeConnectionId' does not expose a tenant identifier."
+            }
         }
-        finally {
-            $newConnections = @(Get-ConnectionInformation -ErrorAction Stop | Where-Object ConnectionId -NotIn $beforeConnections)
-            if ($newConnections.Count -eq 1) { $connectionId = $newConnections[0].ConnectionId }
+        else {
+            $beforeConnections = @(Get-ConnectionInformation -ErrorAction Stop | ForEach-Object { $_.ConnectionId })
+            try {
+                $null = Connect-ExchangeOnline -UserPrincipalName $AdminUserPrincipalName -ShowBanner:$false -ErrorAction Stop
+            }
+            finally {
+                $newConnections = @(Get-ConnectionInformation -ErrorAction Stop | Where-Object ConnectionId -NotIn $beforeConnections)
+                if ($newConnections.Count -eq 1) { $connectionId = $newConnections[0].ConnectionId }
+            }
+            if (-not $connectionId) { throw 'Could not identify a unique connection created by this invocation; refusing ambiguous tenant access.' }
+            $connection = $newConnections[0]
         }
-        if (-not $connectionId) { throw 'Could not identify a unique connection created by this invocation; refusing ambiguous tenant access.' }
-        $connection = $newConnections[0]
         $result.Tenant = "$($connection.TenantID)"
         $context.AcceptedDomains = @(Get-AcceptedDomain -ErrorAction Stop | ForEach-Object { "$($_.DomainName)".ToLowerInvariant() })
         if ($context.Domain -notin $context.AcceptedDomains) { throw 'Requested domain is not an accepted domain in the connected tenant.' }
@@ -835,4 +885,192 @@ function Invoke-M365DomainAuthentication {
     }
 }
 
-Export-ModuleMember -Function Invoke-M365DomainAuthentication
+function Invoke-M365DomainAuthenticationRunner {
+    <#
+    .SYNOPSIS
+    Runs the DKIM/DMARC workflow with runner-owned Exchange authentication.
+
+    .DESCRIPTION
+    Non-interactive external runner for Invoke-M365DomainAuthentication. It uses
+    a certificate-backed Exchange Online app registration, creates one connection
+    in this PowerShell runspace, reuses it for the workflow, and disconnects only
+    that connection. The GoDaddy PAT is read from a secret-provider environment
+    variable. Operation is mandatory. Interactive DNS replacements are rejected.
+
+    .PARAMETER Domain
+    One existing Microsoft 365 mail domain in the connected tenant.
+
+    .PARAMETER Operation
+    Preview for read-only discovery or Apply to authorize idempotent mutations.
+
+    .PARAMETER ExchangeOrganization
+    Tenant domain used by Exchange Online app-only certificate authentication.
+
+    .PARAMETER ExchangeApplicationId
+    Application (client) ID of the runner-owned Exchange app registration.
+
+    .PARAMETER ExchangeCertificateThumbprint
+    Thumbprint of a certificate whose private key is available to this process.
+
+    .PARAMETER GoDaddyTokenEnvironmentVariable
+    Name of the environment variable containing the GoDaddy production PAT.
+    Defaults to M365_DOMAIN_AUTH_GODADDY_PAT. It is never returned.
+
+    .PARAMETER DnsZone
+    Optional GoDaddy parent zone for a subdomain.
+
+    .PARAMETER TimeoutMinutes
+    Timeout for each provisioning and publication polling stage, from 1 to 120.
+
+    .PARAMETER PollSeconds
+    Delay between polling attempts, from 1 to 300 seconds.
+
+    .PARAMETER ReportDirectory
+    Parent directory for apply-run snapshots and result reports.
+
+    .PARAMETER ResultFile
+    Optional file to persist the credential-free structured result for Preview or
+    Apply, including non-success states and runner errors. The parent directory
+    must already exist. This is separate from the engine's apply-run result.json.
+
+    .INPUTS
+    None. Parameters are not bound from pipeline input.
+
+    .OUTPUTS
+    System.Management.Automation.PSCustomObject
+    The same structured result as Invoke-M365DomainAuthentication.
+
+    .EXAMPLE
+    $result = Invoke-M365DomainAuthenticationRunner -Domain example.com -Operation Preview -ExchangeOrganization tenant.onmicrosoft.com -ExchangeApplicationId $appId -ExchangeCertificateThumbprint $thumbprint
+
+    Performs a read-only preview using a runner-created Exchange connection.
+
+    .EXAMPLE
+    $result = Invoke-M365DomainAuthenticationRunner -Domain example.com -Operation Apply -ExchangeOrganization tenant.onmicrosoft.com -ExchangeApplicationId $appId -ExchangeCertificateThumbprint $thumbprint -ReportDirectory $artifactDirectory
+
+    Applies only safe, planned changes. Existing DNS conflicts return Conflict and
+    require separate human resolution; the runner cannot force replacements.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Domain,
+        [Parameter(Mandatory)][ValidateSet('Preview', 'Apply')][string]$Operation,
+        [Parameter(Mandatory)][string]$ExchangeOrganization,
+        [Parameter(Mandatory)][string]$ExchangeApplicationId,
+        [Parameter(Mandatory)][string]$ExchangeCertificateThumbprint,
+        [ValidatePattern('^[A-Za-z_][A-Za-z0-9_]*$')][string]$GoDaddyTokenEnvironmentVariable = 'M365_DOMAIN_AUTH_GODADDY_PAT',
+        [string]$DnsZone,
+        [ValidateRange(1, 120)][int]$TimeoutMinutes = 10,
+        [ValidateRange(1, 300)][int]$PollSeconds = 30,
+        [string]$ReportDirectory = (Join-Path $PWD '.m365-auth-runs'),
+        [string]$ResultFile
+    )
+    $tokenValue = $null
+    $token = $null
+    $connectionIds = @()
+    $startedClean = $false
+    $result = [pscustomobject]@{
+        Operation = $Operation; State = 'Failed'; Domain = $Domain; Tenant = $null
+        DkimInitiallyEnabled = $null; Health = @(); Actions = @(); Changes = @()
+        Conflicts = @(); Warnings = @(); Error = $null; RunDirectory = $null
+        ResultFile = $ResultFile
+    }
+    try {
+        Import-Module ExchangeOnlineManagement -MinimumVersion 3.0 -ErrorAction Stop
+        if (-not (Get-Command Disconnect-ExchangeOnline -ErrorAction Stop).Parameters.ContainsKey('ConnectionId')) {
+            throw 'Update ExchangeOnlineManagement: connection-scoped disconnect is required.'
+        }
+        $beforeConnections = @(Get-ConnectionInformation -ErrorAction Stop)
+        if ($beforeConnections.Count -ne 0) {
+            throw 'The runner requires a clean PowerShell runspace with no pre-existing Exchange connections.'
+        }
+        $startedClean = $true
+        $tokenValue = [Environment]::GetEnvironmentVariable($GoDaddyTokenEnvironmentVariable)
+        if ([string]::IsNullOrWhiteSpace($tokenValue)) {
+            throw "GoDaddy PAT environment variable '$GoDaddyTokenEnvironmentVariable' is missing or empty."
+        }
+        $token = $tokenValue | ConvertTo-SecureString -AsPlainText -Force
+        $null = Connect-ExchangeOnline `
+            -AppId $ExchangeApplicationId `
+            -CertificateThumbprint $ExchangeCertificateThumbprint `
+            -Organization $ExchangeOrganization `
+            -ShowBanner:$false -ErrorAction Stop
+        $newConnections = @(Get-ConnectionInformation -ErrorAction Stop)
+        $connectionIds = @($newConnections | ForEach-Object { $_.ConnectionId } | Where-Object { $_ })
+        if ($newConnections.Count -ne 1) {
+            throw 'Could not identify a unique runner-owned Exchange connection; refusing ambiguous tenant access.'
+        }
+        $connectionId = $connectionIds[0]
+        if (-not $connectionId) { throw 'Runner-owned Exchange connection did not expose a connection identifier.' }
+        $parameters = @{
+            Domain = $Domain
+            ExchangeConnectionId = $connectionId
+            GoDaddyToken = $token
+            DnsZone = $DnsZone
+            Apply = $Operation -eq 'Apply'
+            NonInteractive = $true
+            TimeoutMinutes = $TimeoutMinutes
+            PollSeconds = $PollSeconds
+            ReportDirectory = $ReportDirectory
+        }
+        $result = Invoke-M365DomainAuthentication @parameters
+        $result.ResultFile = $ResultFile
+    }
+    catch {
+        $result.Error = $_.Exception.Message
+        $result.Health = @([pscustomobject]@{
+            Name = 'ExternalRunner'; Status = 'Fail'; Source = 'External runner'
+            Expected = 'Validated request and available external dependencies'
+            Observed = $null; Detail = $result.Error; CheckedAtUtc = [DateTime]::UtcNow.ToString('o')
+        })
+    }
+    finally {
+        $tokenValue = $null
+        $token = $null
+        if ($startedClean -and $connectionIds.Count -eq 0) {
+            try {
+                $connectionIds = @(Get-ConnectionInformation -ErrorAction Stop | ForEach-Object ConnectionId)
+            }
+            catch {
+                $result.State = 'Partial'
+                $result.Warnings = @($result.Warnings) + 'Could not inspect runner-created Exchange connections during cleanup; check active connections manually.'
+            }
+        }
+        foreach ($connectionId in $connectionIds) {
+            try {
+                $null = Disconnect-ExchangeOnline -ConnectionId $connectionId -Confirm:$false -WhatIf:$false -ErrorAction Stop
+            }
+            catch {
+                $result.State = 'Partial'
+                $result.Warnings = @($result.Warnings) + "Could not disconnect runner-owned Exchange connection $connectionId; disconnect it manually."
+            }
+        }
+        if ($ResultFile) {
+            $temporaryFile = $null
+            try {
+                $parent = Split-Path -Parent $ResultFile
+                if (-not $parent) { $parent = '.' }
+                if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+                    throw "ResultFile parent directory '$parent' does not exist."
+                }
+                $temporaryFile = Join-Path $parent ('.' + [IO.Path]::GetFileName($ResultFile) + '.' + [guid]::NewGuid().ToString() + '.tmp')
+                $result | ConvertTo-Json -Depth 20 |
+                    Set-Content -LiteralPath $temporaryFile -Encoding utf8 -ErrorAction Stop
+                Move-Item -LiteralPath $temporaryFile -Destination $ResultFile -Force -ErrorAction Stop
+            }
+            catch {
+                $originalError = $result.Error
+                $result.State = 'Partial'
+                $result.Error = "Could not persist ResultFile: $($_.Exception.Message)"
+                if ($originalError) { $result.Error += " Original error: $originalError" }
+                $result.Warnings = @($result.Warnings) + 'The returned object is authoritative because ResultFile could not be written.'
+                if ($temporaryFile -and (Test-Path -LiteralPath $temporaryFile)) {
+                    Remove-Item -LiteralPath $temporaryFile -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    }
+    return $result
+}
+
+Export-ModuleMember -Function Invoke-M365DomainAuthentication, Invoke-M365DomainAuthenticationRunner

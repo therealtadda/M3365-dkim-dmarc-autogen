@@ -31,8 +31,9 @@ ASCII/punycode domain, not a URL, wildcard, or list. Case/trailing dot normalize
 Must equal DnsZone or be its subdomain.
 
 .PARAMETER AdminUserPrincipalName
-Required administrator UPN for interactive Exchange Online sign-in following your
-tenant's MFA policy. May use a different domain from the mail domain.
+Administrator UPN for interactive Exchange Online sign-in following your tenant's
+MFA policy. Required unless ExchangeConnectionId is supplied. May use a
+different domain from the mail domain.
 
 .PARAMETER GoDaddyToken
 GoDaddy production PAT as a SecureString; securely prompted if omitted. Requires
@@ -44,6 +45,14 @@ in commands, files, logs, or chat; use Read-Host -AsSecureString or a secret man
 GoDaddy zone containing the records; defaults to Domain. For mail.example.com in
 the parent example.com zone, pass example.com. Owners become _dmarc.mail and
 selector1/selector2._domainkey.mail relative to that zone.
+
+.PARAMETER ExchangeConnectionId
+Identifier of an existing Exchange Online connection created by the caller in
+the same PowerShell runspace. Requires -NonInteractive. It is never disconnected.
+
+.PARAMETER NonInteractive
+Requires ExchangeConnectionId and GoDaddyToken, and rejects interactive DNS
+replacement confirmation. Intended for caller-managed non-interactive runners.
 
 .PARAMETER Apply
 Authorizes real changes; off by default. New resources need no additional prompt
@@ -76,8 +85,8 @@ None. Parameters are not bound from pipeline input.
 
 .OUTPUTS
 System.String
-JSON with State, Domain, Tenant, DkimInitiallyEnabled, Health, Actions, Changes,
-Conflicts, Warnings, Error, and RunDirectory. Health contains timestamped
+JSON with Operation, State, Domain, Tenant, DkimInitiallyEnabled, Health, Actions,
+Changes, Conflicts, Warnings, Error, RunDirectory, and ResultFile. Health contains timestamped
 Pass/Fail/Pending/NotVerifiable observations. Inspect the latest per check/source.
 Preview is not proof of readiness; only Completed confirms all mandatory gates.
 
@@ -172,11 +181,13 @@ https://developer.godaddy.com/en/docs/api-users/auth
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory)][string]$Domain,
-    [Parameter(Mandatory)][string]$AdminUserPrincipalName,
+    [string]$AdminUserPrincipalName,
     [Security.SecureString]$GoDaddyToken,
+    [string]$ExchangeConnectionId,
     [string]$DnsZone,
     [switch]$Apply,
     [switch]$ReplaceConflictingRecords,
+    [switch]$NonInteractive,
     [ValidateRange(1, 120)][int]$TimeoutMinutes = 10,
     [ValidateRange(1, 300)][int]$PollSeconds = 30,
     [string]$ReportDirectory = (Join-Path $PWD '.m365-auth-runs')
