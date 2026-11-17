@@ -1,0 +1,6 @@
+.m365-auth-runs/
+*.local.ps1
+*.secrets.*
+.env
+.env.*
+TestResults.xml
